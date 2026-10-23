@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
 import { isScannable, SCANNABLE_EXTENSIONS_IOC } from "../constants.js";
 import type { Finding, VsixContents, ZooData } from "../types.js";
-import { computeLineStarts, findLineNumberByString, getStringContent } from "../utils.js";
+import {
+  computeLineStarts,
+  findLineNumberByIndex,
+  findLineNumberByString,
+  getStringContent,
+} from "../utils.js";
 import { computeSha256 } from "../vsix.js";
 
 const MAX_DOMAIN_LENGTH = 253;
@@ -464,7 +469,7 @@ export function checkWallets(
           continue;
         }
 
-        const line = findLineNumberByString(content, wallet, lineStarts);
+        const line = findLineNumberByIndex(content, start, lineStarts);
 
         if (isKnownMalicious) {
           findings.push({
@@ -475,7 +480,7 @@ export function checkWallets(
               "This wallet is associated with malware campaigns.",
             severity: "critical",
             category: "ioc",
-            location: line !== undefined ? { file: filename, line } : { file: filename },
+            location: { file: filename, line },
             metadata: { wallet, currency: name, knownMalicious: true },
           });
         } else {
@@ -487,7 +492,7 @@ export function checkWallets(
               "VS Code extensions should not contain wallet addresses.",
             severity: "high",
             category: "ioc",
-            location: line !== undefined ? { file: filename, line } : { file: filename },
+            location: { file: filename, line },
             metadata: { wallet, currency: name, knownMalicious: false },
           });
         }

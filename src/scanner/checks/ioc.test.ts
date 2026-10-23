@@ -564,13 +564,14 @@ describe("checkWallets base64 runs", () => {
 
   it("detects a real occurrence after one skipped in a blob", () => {
     const contents = makeContents({
-      "extension.js": `const wasm = ${blob(btc)};const a = "${btc}";`,
+      "extension.js": `const wasm = ${blob(btc)};\nconst a = "${btc}";`,
     });
 
     const findings = checkWallets(contents, new Set());
 
     expect(findings).toHaveLength(1);
     expect(findings[0]?.metadata?.["wallet"]).toBe(btc);
+    expect(findings[0]?.location?.line).toBe(2);
   });
 
   it("still reports a known malicious wallet inside a blob", () => {
