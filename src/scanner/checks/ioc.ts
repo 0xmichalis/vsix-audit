@@ -374,6 +374,37 @@ export function isLikelySolanaAddress(candidate: string): boolean {
   return true;
 }
 
+// A wallet-shaped match inside a long unbroken base64 run (an inlined WASM
+// module, font or image) is a fragment of encoded data, not an address. A
+// real address in a string literal, comment or URL ends the run at a quote,
+// space, ":" or ".". Only up to MIN_BASE64_RUN characters are scanned, so a
+// match inside a multi-megabyte blob stays cheap.
+const MIN_BASE64_RUN = 1000;
+
+function isBase64Char(charCode: number): boolean {
+  return (
+    (charCode >= 48 && charCode <= 57) || // 0-9
+    (charCode >= 65 && charCode <= 90) || // A-Z
+    (charCode >= 97 && charCode <= 122) || // a-z
+    charCode === 43 || // +
+    charCode === 47 || // /
+    charCode === 61 // =
+  );
+}
+
+export function isInsideLongBase64Run(content: string, start: number, end: number): boolean {
+  let length = end - start;
+  for (let i = start - 1; i >= 0 && length < MIN_BASE64_RUN; i--) {
+    if (!isBase64Char(content.charCodeAt(i))) break;
+    length++;
+  }
+  for (let i = end; i < content.length && length < MIN_BASE64_RUN; i++) {
+    if (!isBase64Char(content.charCodeAt(i))) break;
+    length++;
+  }
+  return length >= MIN_BASE64_RUN;
+}
+
 export function checkWallets(
   contents: VsixContents,
   knownWallets: Set<string>,
@@ -423,8 +454,17 @@ export function checkWallets(
           continue;
         }
 
-        const line = findLineNumberByString(content, wallet, lineStarts);
+        // Known malicious wallets are reported wherever they appear.
         const isKnownMalicious = knownWallets.has(wallet);
+        const start = match.index ?? 0;
+        if (!isKnownMalicious && isInsideLongBase64Run(content, start, start + wallet.length)) {
+          // Not counted as seen: the same string elsewhere in the file may be
+          // a real address.
+          seenWallets.delete(wallet);
+          continue;
+        }
+
+        const line = findLineNumberByString(content, wallet, lineStarts);
 
         if (isKnownMalicious) {
           findings.push({

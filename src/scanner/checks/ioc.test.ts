@@ -527,6 +527,64 @@ describe("checkWallets BTC validation", () => {
   });
 });
 
+describe("checkWallets base64 runs", () => {
+  const btc = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa";
+  const sol = "BjVeAjPrSKFiingBn4vZvghsGj9KCE8AJVtbc9S8o8SC";
+  // Base64 padding around a match, as in an inlined WASM module.
+  const blob = (inner: string, pad = 600) => `"${"A".repeat(pad)}+${inner}/${"A".repeat(pad)}"`;
+
+  it("skips matches inside a long base64 run", () => {
+    const contents = makeContents({
+      "extension.js": `const wasm = ${blob(btc)};const w2 = ${blob(sol)};`,
+    });
+
+    expect(checkWallets(contents, new Set())).toHaveLength(0);
+  });
+
+  it("still detects matches in a short base64 run", () => {
+    const contents = makeContents({
+      "extension.js": `const data = ${blob(btc, 100)};`,
+    });
+
+    expect(checkWallets(contents, new Set())).toHaveLength(1);
+  });
+
+  it("still detects addresses in a string literal or URL next to a blob", () => {
+    const contents = makeContents({
+      "extension.js":
+        `const wasm = "${"A".repeat(2000)}";` +
+        `const a = "${btc}";` +
+        `const u = "https://explorer.example/address/${sol}/tx";`,
+    });
+
+    const findings = checkWallets(contents, new Set());
+
+    expect(findings.map((f) => f.metadata?.["currency"])).toEqual(["BTC", "SOL"]);
+  });
+
+  it("detects a real occurrence after one skipped in a blob", () => {
+    const contents = makeContents({
+      "extension.js": `const wasm = ${blob(btc)};const a = "${btc}";`,
+    });
+
+    const findings = checkWallets(contents, new Set());
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.metadata?.["wallet"]).toBe(btc);
+  });
+
+  it("still reports a known malicious wallet inside a blob", () => {
+    const contents = makeContents({
+      "extension.js": `const wasm = ${blob(sol)};`,
+    });
+
+    const findings = checkWallets(contents, new Set([sol]));
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.id).toBe("KNOWN_MALWARE_WALLET");
+  });
+});
+
 describe("checkWallets blockchain allowlist", () => {
   it("skips wallet detection for allowlisted blockchain extensions", () => {
     const contents = makeContentsWithPublisher(
