@@ -241,8 +241,6 @@ const BASE58_INDEX = new Map<string, number>(
 );
 
 function base58Decode(s: string): Uint8Array | null {
-  if (s.length === 0) return null;
-
   let leadingOnes = 0;
   for (const c of s) {
     if (c === "1") leadingOnes++;
@@ -264,8 +262,9 @@ function base58Decode(s: string): Uint8Array | null {
   }
 
   const result = new Uint8Array(leadingOnes + lsbBytes.length);
-  for (let i = 0; i < lsbBytes.length; i++) {
-    result[leadingOnes + lsbBytes.length - 1 - i] = lsbBytes[i]!;
+  let offset = result.length - 1;
+  for (const byte of lsbBytes) {
+    result[offset--] = byte;
   }
   return result;
 }
@@ -294,10 +293,7 @@ export function isValidBitcoinAddress(address: string): boolean {
   const hash1 = createHash("sha256").update(payload).digest();
   const hash2 = createHash("sha256").update(hash1).digest();
 
-  for (let i = 0; i < 4; i++) {
-    if (hash2[i] !== checksum[i]) return false;
-  }
-  return true;
+  return hash2.subarray(0, 4).equals(checksum);
 }
 
 function shannonEntropy(s: string): number {
@@ -372,8 +368,7 @@ export function isLikelySolanaAddress(candidate: string): boolean {
   const uniqueChars = new Set(candidate).size;
   if (uniqueChars < 16) return false;
 
-  // Random Base58 keys cluster around ~5.6 bits/char; English-like
-  // camelCase identifiers fall under ~4.5; repeating patterns under ~3.
+  // This heuristic rejects identifier-like strings; it does not validate keys.
   if (shannonEntropy(candidate) < 4.5) return false;
 
   return true;
@@ -387,16 +382,17 @@ export function isLikelySolanaAddress(candidate: string): boolean {
 const MIN_BASE64_RUN = 1000;
 
 function isBase64Char(charCode: number): boolean {
+  const lowerCaseCode = charCode | 32;
   return (
     (charCode >= 48 && charCode <= 57) || // 0-9
-    (charCode >= 65 && charCode <= 90) || // A-Z
-    (charCode >= 97 && charCode <= 122) || // a-z
+    (lowerCaseCode >= 97 && lowerCaseCode <= 122) || // A-Z, a-z
     charCode === 43 || // +
     charCode === 47 || // /
     charCode === 61 // =
   );
 }
 
+/** Checks whether the match at [start, end) is part of a long Base64 run. */
 export function isInsideLongBase64Run(content: string, start: number, end: number): boolean {
   let length = end - start;
   for (let i = start - 1; i >= 0 && length < MIN_BASE64_RUN; i--) {
@@ -410,96 +406,92 @@ export function isInsideLongBase64Run(content: string, start: number, end: numbe
   return length >= MIN_BASE64_RUN;
 }
 
+function isGenericWalletAddress(currency: string, wallet: string): boolean {
+  if (currency === "SOL") return isLikelySolanaAddress(wallet);
+  if (currency === "BTC" && wallet.slice(0, 3).toLowerCase() !== "bc1") {
+    return isValidBitcoinAddress(wallet);
+  }
+  return true;
+}
+
+function checkWalletsInFile(
+  filename: string,
+  content: string,
+  knownWallets: Set<string>,
+): Finding[] {
+  const findings: Finding[] = [];
+  const lineStarts = computeLineStarts(content);
+  const seenWallets = new Set<string>();
+
+  for (const { name, pattern } of WALLET_PATTERNS) {
+    pattern.lastIndex = 0;
+
+    for (const match of content.matchAll(pattern)) {
+      const wallet = match[0];
+      if (seenWallets.has(wallet)) continue;
+      // Invalid BTC matches must not be reclassified by the broad Solana pattern.
+      seenWallets.add(wallet);
+
+      const isKnownMalicious = knownWallets.has(wallet);
+      const start = match.index;
+      if (!isKnownMalicious) {
+        if (!isGenericWalletAddress(name, wallet)) continue;
+
+        if (isInsideLongBase64Run(content, start, start + wallet.length)) {
+          // A later occurrence outside the blob must remain eligible.
+          seenWallets.delete(wallet);
+          continue;
+        }
+      }
+
+      const line = findLineNumberByIndex(content, start, lineStarts);
+
+      if (isKnownMalicious) {
+        findings.push({
+          id: "KNOWN_MALWARE_WALLET",
+          title: "Known malware wallet address detected",
+          description:
+            `File "${filename}" contains known malicious ${name} wallet: ${wallet}. ` +
+            "This wallet is associated with malware campaigns.",
+          severity: "critical",
+          category: "ioc",
+          location: { file: filename, line },
+          metadata: { wallet, currency: name, knownMalicious: true },
+        });
+      } else {
+        findings.push({
+          id: "CRYPTO_WALLET_DETECTED",
+          title: "Cryptocurrency wallet address detected",
+          description:
+            `File "${filename}" contains ${name} wallet address: ${wallet}. ` +
+            "VS Code extensions should not contain wallet addresses.",
+          severity: "high",
+          category: "ioc",
+          location: { file: filename, line },
+          metadata: { wallet, currency: name, knownMalicious: false },
+        });
+      }
+    }
+  }
+
+  return findings;
+}
+
+/** Reports wallet candidates in scannable files, except in allowlisted extensions. */
 export function checkWallets(
   contents: VsixContents,
   knownWallets: Set<string>,
   blockchainAllowlist?: Set<string>,
 ): Finding[] {
-  // Skip wallet detection for allowlisted blockchain development extensions
   const extensionId = `${contents.manifest.publisher}.${contents.manifest.name}`;
-  if (blockchainAllowlist?.has(extensionId)) {
-    return [];
-  }
+  if (blockchainAllowlist?.has(extensionId)) return [];
 
   const findings: Finding[] = [];
-
   for (const [filename, buffer] of contents.files) {
     if (!isScannable(filename, SCANNABLE_EXTENSIONS_IOC)) continue;
-
     const content = getStringContent(contents, filename, buffer);
-    const lineStarts = computeLineStarts(content);
-    // Track wallets already found in this file to avoid duplicate findings
-    // (e.g., BTC addresses matching both BTC and SOL patterns)
-    const seenWallets = new Set<string>();
-
-    for (const { name, pattern } of WALLET_PATTERNS) {
-      // Reset regex state
-      pattern.lastIndex = 0;
-
-      for (const match of content.matchAll(pattern)) {
-        const wallet = match[0];
-
-        // Skip if we've already reported this wallet address
-        if (seenWallets.has(wallet)) continue;
-        seenWallets.add(wallet);
-
-        // For SOL pattern, apply additional validation to filter out JS identifiers
-        if (name === "SOL" && !isLikelySolanaAddress(wallet)) {
-          continue;
-        }
-
-        // For BTC P2PKH/P2SH, verify the Base58Check checksum. The Bech32
-        // variant ("bc1…", case-insensitive per BIP173) uses a different
-        // checksum scheme and is not validated here.
-        if (
-          name === "BTC" &&
-          wallet.slice(0, 3).toLowerCase() !== "bc1" &&
-          !isValidBitcoinAddress(wallet)
-        ) {
-          continue;
-        }
-
-        // Known malicious wallets are reported wherever they appear.
-        const isKnownMalicious = knownWallets.has(wallet);
-        const start = match.index ?? 0;
-        if (!isKnownMalicious && isInsideLongBase64Run(content, start, start + wallet.length)) {
-          // Not counted as seen: the same string elsewhere in the file may be
-          // a real address.
-          seenWallets.delete(wallet);
-          continue;
-        }
-
-        const line = findLineNumberByIndex(content, start, lineStarts);
-
-        if (isKnownMalicious) {
-          findings.push({
-            id: "KNOWN_MALWARE_WALLET",
-            title: "Known malware wallet address detected",
-            description:
-              `File "${filename}" contains known malicious ${name} wallet: ${wallet}. ` +
-              "This wallet is associated with malware campaigns.",
-            severity: "critical",
-            category: "ioc",
-            location: { file: filename, line },
-            metadata: { wallet, currency: name, knownMalicious: true },
-          });
-        } else {
-          findings.push({
-            id: "CRYPTO_WALLET_DETECTED",
-            title: "Cryptocurrency wallet address detected",
-            description:
-              `File "${filename}" contains ${name} wallet address: ${wallet}. ` +
-              "VS Code extensions should not contain wallet addresses.",
-            severity: "high",
-            category: "ioc",
-            location: { file: filename, line },
-            metadata: { wallet, currency: name, knownMalicious: false },
-          });
-        }
-      }
-    }
+    findings.push(...checkWalletsInFile(filename, content, knownWallets));
   }
-
   return findings;
 }
 

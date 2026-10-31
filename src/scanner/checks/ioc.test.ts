@@ -8,6 +8,7 @@ import {
   checkIocs,
   checkIps,
   checkWallets,
+  isInsideLongBase64Run,
   isLikelySolanaAddress,
   isValidBitcoinAddress,
 } from "./ioc.js";
@@ -28,6 +29,10 @@ function makeContents(files: Record<string, string>): VsixContents {
     files: fileMap,
     basePath: "/test",
   };
+}
+
+function makeWalletBlob(wallet: string, pad = 600): string {
+  return `"${"A".repeat(pad)}+${wallet}/${"A".repeat(pad)}"`;
 }
 
 function makeZooData(overrides: Partial<ZooData> = {}): ZooData {
@@ -454,6 +459,28 @@ describe("isLikelySolanaAddress", () => {
 });
 
 describe("isValidBitcoinAddress", () => {
+  // Bitcoin Core src/test/data/key_io_valid.json mainnet and testnet4 vectors.
+  it.each([
+    ["1FsSia9rv4NeEwvJ2GvXrX7LyxYspbN2mo", true],
+    ["36j4NfKv6Akva9amjWrLG6MuSQym1GuEmm", true],
+    ["mzK2FFDEhxqHcmrJw1ysqFkVyhUULo45hZ", false],
+    ["2NC2hEhe28ULKAJkW5MjZ3jtTMJdvXmByvK", false],
+  ])("validates the network version of %s", (address, expected) => {
+    expect(isValidBitcoinAddress(address)).toBe(expected);
+  });
+
+  it("rejects invalid Base58 characters at every address position", () => {
+    for (const address of [
+      "1FsSia9rv4NeEwvJ2GvXrX7LyxYspbN2mo",
+      "36j4NfKv6Akva9amjWrLG6MuSQym1GuEmm",
+    ]) {
+      for (let index = 0; index < address.length; index++) {
+        const malformed = `${address.slice(0, index)}0${address.slice(index + 1)}`;
+        expect(isValidBitcoinAddress(malformed)).toBe(false);
+      }
+    }
+  });
+
   it("accepts real P2PKH addresses (start with 1)", () => {
     // Satoshi's genesis block address
     expect(isValidBitcoinAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")).toBe(true);
@@ -491,13 +518,21 @@ describe("isValidBitcoinAddress", () => {
     // Real legacy addresses are 26–35 chars; anything outside should
     // short-circuit before base58Decode runs.
     expect(isValidBitcoinAddress("1A1zP1eP")).toBe(false); // too short
-    expect(
-      isValidBitcoinAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa1A1zP1eP5QGefi2DMPTfTL"),
-    ).toBe(false); // too long
+    expect(isValidBitcoinAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa1A1zP1eP5QGefi2DMPTfTL")).toBe(
+      false,
+    ); // too long
   });
 });
 
 describe("checkWallets BTC validation", () => {
+  it("does not reclassify a Bitcoin checksum failure as a Solana wallet", () => {
+    const contents = makeContents({
+      "extension.js": 'const wallet = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb";',
+    });
+
+    expect(checkWallets(contents, new Set())).toEqual([]);
+  });
+
   it("filters out garbage Base58 substrings in minified JS", () => {
     const contents = makeContents({
       // Real false positives observed in Copilot Chat extension bundle
@@ -530,12 +565,36 @@ describe("checkWallets BTC validation", () => {
 describe("checkWallets base64 runs", () => {
   const btc = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa";
   const sol = "BjVeAjPrSKFiingBn4vZvghsGj9KCE8AJVtbc9S8o8SC";
-  // Base64 padding around a match, as in an inlined WASM module.
-  const blob = (inner: string, pad = 600) => `"${"A".repeat(pad)}+${inner}/${"A".repeat(pad)}"`;
+
+  it("classifies generated Base64 contexts by the length of the containing run", () => {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+    const lengths = [0, 1, 32, 499, 500, 998, 999, 1000, 1001];
+    const padding = alphabet.repeat(16);
+    for (const left of lengths) {
+      for (const right of lengths) {
+        const content = `!${padding.slice(0, left)}${btc}${padding.slice(0, right)}!`;
+        const start = left + 1;
+        expect(isInsideLongBase64Run(content, start, start + btc.length)).toBe(
+          left + btc.length + right >= 1000,
+        );
+      }
+    }
+  });
+
+  it.each([
+    [999, 1],
+    [1000, 0],
+    [1001, 0],
+  ])("reports %s-character base64 runs with %s findings", (length, expected) => {
+    const padding = "A".repeat(length - btc.length - 2);
+    const contents = makeContents({ "extension.js": `const data = "${padding}+${btc}/";` });
+
+    expect(checkWallets(contents, new Set())).toHaveLength(expected);
+  });
 
   it("skips matches inside a long base64 run", () => {
     const contents = makeContents({
-      "extension.js": `const wasm = ${blob(btc)};const w2 = ${blob(sol)};`,
+      "extension.js": `const wasm = ${makeWalletBlob(btc)};const w2 = ${makeWalletBlob(sol)};`,
     });
 
     expect(checkWallets(contents, new Set())).toHaveLength(0);
@@ -543,7 +602,7 @@ describe("checkWallets base64 runs", () => {
 
   it("still detects matches in a short base64 run", () => {
     const contents = makeContents({
-      "extension.js": `const data = ${blob(btc, 100)};`,
+      "extension.js": `const data = ${makeWalletBlob(btc, 100)};`,
     });
 
     expect(checkWallets(contents, new Set())).toHaveLength(1);
@@ -564,7 +623,7 @@ describe("checkWallets base64 runs", () => {
 
   it("detects a real occurrence after one skipped in a blob", () => {
     const contents = makeContents({
-      "extension.js": `const wasm = ${blob(btc)};\nconst a = "${btc}";`,
+      "extension.js": `const wasm = ${makeWalletBlob(btc)};\nconst a = "${btc}";`,
     });
 
     const findings = checkWallets(contents, new Set());
@@ -576,13 +635,48 @@ describe("checkWallets base64 runs", () => {
 
   it("still reports a known malicious wallet inside a blob", () => {
     const contents = makeContents({
-      "extension.js": `const wasm = ${blob(sol)};`,
+      "extension.js": `const wasm = ${makeWalletBlob(sol)};`,
     });
 
     const findings = checkWallets(contents, new Set([sol]));
 
     expect(findings).toHaveLength(1);
     expect(findings[0]?.id).toBe("KNOWN_MALWARE_WALLET");
+  });
+});
+
+describe("checkWallets known-wallet precedence", () => {
+  it.each(["Ab12".repeat(11), "Li4u".repeat(11), "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb"])(
+    "preserves a configured known wallet despite generic filters: %s",
+    (wallet) => {
+      const contents = makeContents({ "extension.js": `const data = ${makeWalletBlob(wallet)};` });
+
+      const findings = checkWallets(contents, new Set([wallet]));
+
+      expect(findings).toEqual([
+        expect.objectContaining({
+          id: "KNOWN_MALWARE_WALLET",
+          severity: "critical",
+          location: { file: "extension.js", line: 1 },
+          metadata: expect.objectContaining({ wallet, knownMalicious: true }),
+        }),
+      ]);
+    },
+  );
+
+  it("reports a known wallet once per file at its first occurrence", () => {
+    const wallet = "Ab12".repeat(11);
+    const contents = makeContents({
+      "extension.js": `const data = ${makeWalletBlob(wallet)};\nconst wallet = "${wallet}";`,
+      "other.js": `const wallet = "${wallet}";`,
+    });
+
+    const findings = checkWallets(contents, new Set([wallet]));
+
+    expect(findings.map(({ id, location }) => ({ id, location }))).toEqual([
+      { id: "KNOWN_MALWARE_WALLET", location: { file: "extension.js", line: 1 } },
+      { id: "KNOWN_MALWARE_WALLET", location: { file: "other.js", line: 1 } },
+    ]);
   });
 });
 
